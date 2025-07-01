@@ -31,8 +31,12 @@ local progressBarBgColor = colors.black -- Or a darker gray
 local progressBarChar = "█"
 local progressBarEmptyChar = " " -- Use space with background color
 
--- Global for the energy peripheral
+-- Global for the energy peripheral and its capabilities
 local energyCell = nil
+local energyCellCapabilities = {
+    hasEnergyStorage = false, -- Generic getEnergy/getMaxEnergy
+    hasAdvancedIO = false    -- AP-style getLastInput/getLastOutput
+}
 
 local function clearScreen()
     mon.setBackgroundColor(mainBgColor)
@@ -91,7 +95,8 @@ local function drawLayout()
     -- Layout positions, content starts effectively at Y=3 (after a blank line separator)
     local positions = {
         peripheralNameY = 0, statusY = 0, progressBarY = 0,
-        currentEnergyNumY = 0, maxEnergyY = 0
+        currentEnergyNumY = 0, maxEnergyY = 0,
+        inputRateY = 0, outputRateY = 0 -- New fields
     }
     local currentY = 3 -- Start content sections at line 3
 
@@ -122,6 +127,12 @@ local function drawLayout()
     currentY = currentY + 1
     positions.maxEnergyY = currentY
     mon.setCursorPos(5, currentY) ; mon.write("Max Capacity:")
+    currentY = currentY + 1
+    positions.inputRateY = currentY
+    mon.setCursorPos(5, currentY) ; mon.write("Input Rate:")
+    currentY = currentY + 1
+    positions.outputRateY = currentY
+    mon.setCursorPos(5, currentY) ; mon.write("Output Rate:")
     currentY = currentY + 2 -- Blank line spacer
 
     -- Section: SYSTEM INFORMATION
@@ -138,18 +149,77 @@ local function drawLayout()
 end
 
 local function findEnergyPeripheral()
-    local names = peripheral.getNames()
-    for i = 1, #names do
-        if peripheral.hasType(names[i], "energy_storage") then
-            energyCell = peripheral.wrap(names[i])
-            if energyCell then
-                return true
+    energyCell = nil
+    energyCellCapabilities.hasEnergyStorage = false
+    energyCellCapabilities.hasAdvancedIO = false
+
+    local pNames = peripheral.getNames()
+    local candidates = {}
+
+    for i = 1, #pNames do
+        local name = pNames[i]
+        local pType = peripheral.getType(name)
+        local wrapped = peripheral.wrap(name)
+
+        if wrapped then
+            -- Check for specific Mekanism types first, then generic energy_storage
+            -- Common Mekanism port/valve names might include "induction_port", "induction_valve"
+            -- or types provided by Mekanism's own integration if AP is not the provider.
+            -- Advanced Peripherals might name it something like "mekanism_induction_port" or similar.
+
+            local hasIO = wrapped.getLastInput and wrapped.getLastOutput
+            local hasStorage = wrapped.getEnergy and wrapped.getMaxEnergy
+
+            if pType and (string.find(pType, "mekanism") or string.find(pType, "induction")) then
+                if hasIO and hasStorage then -- Ideal candidate
+                    table.insert(candidates, 1, {name=name, wrapped=wrapped, io=true, storage=true, type=pType}) -- Prioritize
+                elseif hasStorage then
+                    table.insert(candidates, {name=name, wrapped=wrapped, io=false, storage=true, type=pType})
+                end
+            elseif peripheral.hasType(name, "energy_storage") and hasStorage then
+                 table.insert(candidates, {name=name, wrapped=wrapped, io=false, storage=true, type="energy_storage"})
             end
         end
     end
-    -- Fallback: try finding any peripheral of type "energy_storage" without knowing its name
-    energyCell = peripheral.find("energy_storage")
-    return energyCell ~= nil
+
+    if #candidates > 0 then
+        -- Select the best candidate (prioritizing those with I/O)
+        local bestCandidate = candidates[1] -- Already sorted by insertion logic roughly
+        for i = 2, #candidates do
+            if candidates[i].io and not bestCandidate.io then
+                bestCandidate = candidates[i]
+            end
+        end
+
+        energyCell = bestCandidate.wrapped
+        energyCellCapabilities.hasAdvancedIO = bestCandidate.io
+        energyCellCapabilities.hasEnergyStorage = bestCandidate.storage
+
+        -- If it has advanced I/O, we assume it also has basic storage functions
+        -- or that the advanced functions are preferred.
+        -- If only basic storage is found, that's fine too.
+        return true
+    end
+
+    -- Fallback to generic peripheral.find if no named ones matched criteria but had the type
+    -- This part is a bit redundant if the loop above correctly wraps and checks types/methods.
+    -- Let's try to find a generic one if the specific search yields nothing with methods.
+    local genericEnergy = peripheral.find("energy_storage")
+    if genericEnergy then
+        if genericEnergy.getLastInput and genericEnergy.getLastOutput and genericEnergy.getEnergy and genericEnergy.getMaxEnergy then
+            energyCell = genericEnergy
+            energyCellCapabilities.hasAdvancedIO = true
+            energyCellCapabilities.hasEnergyStorage = true
+            return true
+        elseif genericEnergy.getEnergy and genericEnergy.getMaxEnergy then
+            energyCell = genericEnergy
+            energyCellCapabilities.hasAdvancedIO = false
+            energyCellCapabilities.hasEnergyStorage = true
+            return true
+        end
+    end
+
+    return false
 end
 
 local function formatEnergyValue(value)
@@ -183,48 +253,76 @@ local function updateDynamicData()
 
     if energyCell then
         mon.setTextColor(mainTextColor)
+        -- Peripheral Name
         clearLine(p.peripheralNameY, dataStartX)
         mon.setCursorPos(dataStartX, p.peripheralNameY)
         local pName = peripheral.getName(energyCell)
         mon.write(pName or peripheral.getType(energyCell) or "Unknown")
 
+        -- Status
         clearLine(p.statusY, dataStartX)
         mon.setCursorPos(dataStartX, p.statusY)
-        mon.setTextColor(colors.green) -- Or another status color
+        mon.setTextColor(colors.green)
         mon.write("Online")
         mon.setTextColor(mainTextColor)
 
-        local currentEnergy, errEnergy = energyCell.getEnergy()
-        local maxEnergy, errCapacity = energyCell.getEnergyCapacity()
+        local currentEnergy, maxEnergy, percentage
+        local inputRate, outputRate
+        local hasStorageData = false
+        local hasIOData = false
 
-        if currentEnergy == nil or maxEnergy == nil then -- Check for nil specifically
-            mon.setTextColor(errorColor)
+        -- Fetch Basic Energy Storage Data
+        if energyCellCapabilities.hasEnergyStorage then
+            local currentE, errE = pcall(function() return energyCell.getEnergy() end)
+            local maxE, errMaxE = pcall(function() return energyCell.getMaxEnergy() end)
+
+            if currentE and maxE and type(currentE) == "number" and type(maxE) == "number" then
+                currentEnergy = currentE
+                maxEnergy = maxE
+                if maxEnergy > 0 then
+                    percentage = (currentEnergy / maxEnergy) * 100
+                else
+                    percentage = 0
+                end
+                hasStorageData = true
+            else
+                -- Error fetching basic storage, display on progress bar line
+                mon.setTextColor(errorColor)
+                clearLine(p.progressBarY, dataStartX)
+                mon.setCursorPos(dataStartX, p.progressBarY)
+                mon.write("Storage Error")
+                mon.setTextColor(mainTextColor)
+                -- Clear other related fields too
+                clearLine(p.currentEnergyNumY, dataStartX)
+                clearLine(p.maxEnergyY, dataStartX)
+            end
+        end
+
+        -- Fetch Advanced I/O Data
+        if energyCellCapabilities.hasAdvancedIO then
+            local inputR, errIn = pcall(function() return energyCell.getLastInput() end)
+            local outputR, errOut = pcall(function() return energyCell.getLastOutput() end)
+
+            if inputR and outputR and type(inputR) == "number" and type(outputR) == "number" then
+                inputRate = inputR
+                outputRate = outputR
+                hasIOData = true
+            else
+                 -- Error fetching I/O, display on I/O lines (to be added in UI step)
+                 -- For now, just means inputRate/outputRate will be nil
+            end
+        end
+
+        -- Display Stored Energy if available
+        if hasStorageData then
+            -- Progress Bar
+            local barAreaWidth = w - dataStartX - 1 - 5
+            local percentageTextWidth = #string.format(" %.0f%%", percentage)
+            local barWidth = math.max(10, barAreaWidth - percentageTextWidth)
+            local filledWidth = math.floor((percentage / 100) * barWidth)
+
             clearLine(p.progressBarY, dataStartX)
             mon.setCursorPos(dataStartX, p.progressBarY)
-            mon.write("Error reading data")
-
-            clearLine(p.currentEnergyNumY, dataStartX)
-
-            clearLine(p.maxEnergyY, dataStartX)
-            mon.setCursorPos(dataStartX, p.maxEnergyY)
-            mon.write(errEnergy or errCapacity or "Peripheral error")
-            mon.setTextColor(mainTextColor)
-            return
-        end
-
-        local percentage = 0
-        if maxEnergy > 0 then
-            percentage = (currentEnergy / maxEnergy) * 100
-        end
-
-        -- Progress Bar
-        local barAreaWidth = w - dataStartX - 1 - 5 -- Available width for bar + percentage text
-        local percentageTextWidth = #string.format(" %.0f%%", percentage)
-        local barWidth = math.max(10, barAreaWidth - percentageTextWidth)
-        local filledWidth = math.floor((percentage / 100) * barWidth)
-
-        clearLine(p.progressBarY, dataStartX)
-        mon.setCursorPos(dataStartX, p.progressBarY)
 
         -- Draw filled part of the bar
         mon.setTextColor(progressBarColor)
@@ -240,7 +338,7 @@ local function updateDynamicData()
         mon.setTextColor(mainTextColor)
         mon.write(string.format(" %.0f%%", percentage))
 
-        -- Numerical Values
+        -- Numerical Values for Stored Energy
         clearLine(p.currentEnergyNumY, dataStartX)
         mon.setCursorPos(dataStartX, p.currentEnergyNumY)
         mon.write(formatEnergyValue(currentEnergy))
@@ -248,8 +346,52 @@ local function updateDynamicData()
         clearLine(p.maxEnergyY, dataStartX)
         mon.setCursorPos(dataStartX, p.maxEnergyY)
         mon.write(formatEnergyValue(maxEnergy))
+    elseif not energyCellCapabilities.hasEnergyStorage and energyCell then
+        -- Has a cell, but no storage data (maybe only I/O if that was possible, or error'd)
+        mon.setTextColor(errorColor)
+        clearLine(p.progressBarY, dataStartX)
+        mon.setCursorPos(dataStartX, p.progressBarY)
+        mon.write("No storage data")
+        mon.setTextColor(mainTextColor)
+        clearLine(p.currentEnergyNumY, dataStartX)
+        clearLine(p.maxEnergyY, dataStartX)
+    end
 
-    else
+    -- Display I/O Rates if available (Y positions for these will be added in drawLayout next)
+    if energyCellCapabilities.hasAdvancedIO then
+        if hasIOData then
+            clearLine(p.inputRateY, dataStartX) -- Assuming p.inputRateY will be defined
+            mon.setCursorPos(dataStartX, p.inputRateY)
+            mon.write(formatEnergyValue(inputRate) .. "/t")
+
+            clearLine(p.outputRateY, dataStartX) -- Assuming p.outputRateY will be defined
+            mon.setCursorPos(dataStartX, p.outputRateY)
+            mon.write(formatEnergyValue(outputRate) .. "/t")
+        else
+            -- Error fetching I/O data or methods don't exist though capability was true (should be rare)
+            mon.setTextColor(errorColor)
+            clearLine(p.inputRateY, dataStartX)
+            mon.setCursorPos(dataStartX, p.inputRateY)
+            mon.write("I/O Error")
+
+            clearLine(p.outputRateY, dataStartX)
+            mon.setCursorPos(dataStartX, p.outputRateY)
+            mon.write("I/O Error")
+            mon.setTextColor(mainTextColor)
+        end
+    elseif energyCell then -- No advanced I/O, but we have a cell, so clear I/O fields
+        if p.inputRateY and p.outputRateY then -- Check if UI fields exist for I/O
+            clearLine(p.inputRateY, dataStartX)
+            mon.setCursorPos(dataStartX, p.inputRateY)
+            mon.write("N/A")
+            clearLine(p.outputRateY, dataStartX)
+            mon.setCursorPos(dataStartX, p.outputRateY)
+            mon.write("N/A")
+        end
+    end
+
+
+    if not energyCell then -- Complete absence of a peripheral
         mon.setTextColor(errorColor)
         clearLine(p.peripheralNameY, dataStartX)
         mon.setCursorPos(dataStartX, p.peripheralNameY)
@@ -264,9 +406,9 @@ local function updateDynamicData()
         clearLine(p.progressBarY, dataStartX)
         mon.setCursorPos(dataStartX, p.progressBarY)
         local barAreaWidth = w - dataStartX - 1 - 5
-        local percentageTextWidth = #(" ---%")
+        local percentageTextWidth = #(" ---%") -- Width of " ---%"
         local barWidth = math.max(10, barAreaWidth - percentageTextWidth)
-        mon.write(string.rep(" ", barWidth) .. " ---%")
+        mon.write(string.rep(progressBarEmptyChar, barWidth) .. " ---%") -- Use progressBarEmptyChar for consistency
 
         clearLine(p.currentEnergyNumY, dataStartX)
         mon.setCursorPos(dataStartX, p.currentEnergyNumY)
@@ -275,6 +417,18 @@ local function updateDynamicData()
         clearLine(p.maxEnergyY, dataStartX)
         mon.setCursorPos(dataStartX, p.maxEnergyY)
         mon.write(formatEnergyValue(nil))
+
+        -- Clear I/O fields as well if they exist in layout
+        if p.inputRateY then
+            clearLine(p.inputRateY, dataStartX)
+            mon.setCursorPos(dataStartX, p.inputRateY)
+            mon.write(formatEnergyValue(nil)) -- formatEnergyValue handles nil to "N/A"
+        end
+        if p.outputRateY then
+            clearLine(p.outputRateY, dataStartX)
+            mon.setCursorPos(dataStartX, p.outputRateY)
+            mon.write(formatEnergyValue(nil))
+        end
     end
 end
 
